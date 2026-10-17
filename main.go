@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rob121/cannon/extension"
@@ -22,7 +23,7 @@ const (
 	extensionName        = "cannon-ext-captcha-cfturnstile"
 	extensionTitle       = "Cloudflare Turnstile"
 	extensionDescription = "Provides Cloudflare Turnstile captcha rendering and verification for Cannon protected forms."
-	extensionVersion     = "0.2.0"
+	extensionVersion     = "0.2.2"
 	updateURLBase        = "https://github.com/rob121/cannon-ext-captcha-cfturnstile/releases/download"
 	configSection        = "general"
 	fieldName            = "cf-turnstile-response"
@@ -35,13 +36,23 @@ var turnstileConfigSchema = json.RawMessage(`{
   "properties": {
     "site_key": {
       "type": "string",
-      "title": "Site Key",
-      "description": "Cloudflare Turnstile public site key."
+      "title": "Live Site Key",
+      "description": "Cloudflare Turnstile site key used when Cannon Development Mode is off."
     },
     "secret_key": {
       "type": "string",
-      "title": "Secret Key",
-      "description": "Cloudflare Turnstile secret key used for server-side verification."
+      "title": "Live Secret Key",
+      "description": "Cloudflare Turnstile secret key used when Cannon Development Mode is off."
+    },
+    "test_site_key": {
+      "type": "string",
+      "title": "Test Site Key",
+      "description": "Used when Cannon Development Mode is on. Use Cloudflare dummy keys (e.g. always-pass 1x00000000000000000000AA)."
+    },
+    "test_secret_key": {
+      "type": "string",
+      "title": "Test Secret Key",
+      "description": "Used when Cannon Development Mode is on. Pair with the test site key (e.g. 1x0000000000000000000000000000000AA)."
     }
   },
   "required": ["site_key", "secret_key"]
@@ -50,8 +61,14 @@ var turnstileConfigSchema = json.RawMessage(`{
 var turnstileConfigUI = json.RawMessage(`{
   "type": "VerticalLayout",
   "elements": [
-    {"type": "Control", "scope": "#/properties/site_key"},
-    {"type": "Control", "scope": "#/properties/secret_key"}
+    {"type": "Group", "label": "Live Keys", "elements": [
+      {"type": "Control", "scope": "#/properties/site_key"},
+      {"type": "Control", "scope": "#/properties/secret_key"}
+    ]},
+    {"type": "Group", "label": "Test Keys (Development Mode)", "elements": [
+      {"type": "Control", "scope": "#/properties/test_site_key"},
+      {"type": "Control", "scope": "#/properties/test_secret_key"}
+    ]}
   ]
 }`)
 
@@ -60,11 +77,17 @@ type turnstileApp struct {
 	settingsTable string
 	verifyURL     string
 	client        *http.Client
+
+	settingsMu     sync.RWMutex
+	settingsCache  turnstileSettings
+	settingsCached bool
 }
 
 type turnstileSettings struct {
-	SiteKey   string `json:"site_key"`
-	SecretKey string `json:"secret_key"`
+	SiteKey       string `json:"site_key"`
+	SecretKey     string `json:"secret_key"`
+	TestSiteKey   string `json:"test_site_key"`
+	TestSecretKey string `json:"test_secret_key"`
 }
 
 type cloudflareVerifyResponse struct {
@@ -107,7 +130,7 @@ func newServerWithHTTP(verifyURL string, client *http.Client) *extension.Server 
 			Schema:   turnstileConfigSchema,
 			UISchema: turnstileConfigUI,
 		},
-	}, configStore{table: app.settingsTable}))
+	}, configStore{table: app.settingsTable, app: app}))
 	s.RegisterCaptcha(extension.CaptchaRegistration{
 		ProviderInfo: app.providerInfo,
 		Render:       app.render,
@@ -125,7 +148,11 @@ func (app *turnstileApp) install(req extension.WireRequest) error {
 }
 
 func (app *turnstileApp) providerInfo(req extension.WireRequest) (extension.CaptchaProviderInfo, error) {
-	settings, err := loadSettings(app.settingsTable)
+	settings, err := app.loadSettings()
+	if err != nil {
+		return extension.CaptchaProviderInfo{}, err
+	}
+	siteKey, _, err := settings.activeKeys(req)
 	if err != nil {
 		return extension.CaptchaProviderInfo{}, err
 	}
@@ -139,22 +166,23 @@ func (app *turnstileApp) providerInfo(req extension.WireRequest) (extension.Capt
 			extension.CaptchaContextForm,
 		},
 		Client: map[string]string{
-			"site_key": settings.SiteKey,
+			"site_key": siteKey,
 		},
 	}, nil
 }
 
 func (app *turnstileApp) render(req extension.WireRequest) (extension.CaptchaRenderResult, error) {
-	settings, err := loadSettings(app.settingsTable)
+	settings, err := app.loadSettings()
 	if err != nil {
 		return extension.CaptchaRenderResult{}, err
 	}
-	if strings.TrimSpace(settings.SiteKey) == "" {
-		return extension.CaptchaRenderResult{}, fmt.Errorf("turnstile site key is not configured")
+	siteKey, _, err := settings.activeKeys(req)
+	if err != nil {
+		return extension.CaptchaRenderResult{}, err
 	}
 	attrs := []string{
 		`class="cf-turnstile"`,
-		`data-sitekey="` + html.EscapeString(settings.SiteKey) + `"`,
+		`data-sitekey="` + html.EscapeString(siteKey) + `"`,
 	}
 	if action := sanitizeAction(extension.CaptchaAction(req)); action != "" {
 		attrs = append(attrs, `data-action="`+html.EscapeString(action)+`"`)
@@ -167,15 +195,16 @@ func (app *turnstileApp) render(req extension.WireRequest) (extension.CaptchaRen
 }
 
 func (app *turnstileApp) verify(req extension.WireRequest) (extension.CaptchaVerifyResult, error) {
-	settings, err := loadSettings(app.settingsTable)
+	settings, err := app.loadSettings()
 	if err != nil {
 		return extension.CaptchaVerifyResult{}, err
 	}
-	if strings.TrimSpace(settings.SecretKey) == "" {
-		return extension.CaptchaVerifyResult{Valid: false, Error: "turnstile secret key is not configured"}, nil
+	_, secretKey, err := settings.activeKeys(req)
+	if err != nil {
+		return extension.CaptchaVerifyResult{Valid: false, Error: err.Error()}, nil
 	}
 	form := url.Values{}
-	form.Set("secret", settings.SecretKey)
+	form.Set("secret", secretKey)
 	form.Set("response", extension.CaptchaToken(req))
 	if remoteIP := extension.CaptchaRemoteIP(req); remoteIP != "" {
 		form.Set("remoteip", remoteIP)
@@ -211,9 +240,36 @@ func (app *turnstileApp) verify(req extension.WireRequest) (extension.CaptchaVer
 	return extension.CaptchaVerifyResult{Valid: false, Error: errMsg}, nil
 }
 
-func loadSettings(table string) (turnstileSettings, error) {
-	store := configStore{table: table}
-	data, err := store.Load(configSection)
+func (cfg turnstileSettings) activeKeys(req extension.WireRequest) (siteKey, secretKey string, err error) {
+	if extension.DevelopmentMode(req) {
+		siteKey = strings.TrimSpace(cfg.TestSiteKey)
+		secretKey = strings.TrimSpace(cfg.TestSecretKey)
+		if siteKey == "" || secretKey == "" {
+			return "", "", fmt.Errorf("turnstile test keys are not configured (enable Development Mode requires test_site_key and test_secret_key)")
+		}
+		return siteKey, secretKey, nil
+	}
+	siteKey = strings.TrimSpace(cfg.SiteKey)
+	secretKey = strings.TrimSpace(cfg.SecretKey)
+	if siteKey == "" {
+		return "", "", fmt.Errorf("turnstile site key is not configured")
+	}
+	if secretKey == "" {
+		return "", "", fmt.Errorf("turnstile secret key is not configured")
+	}
+	return siteKey, secretKey, nil
+}
+
+func (app *turnstileApp) loadSettings() (turnstileSettings, error) {
+	app.settingsMu.RLock()
+	if app.settingsCached {
+		cfg := app.settingsCache
+		app.settingsMu.RUnlock()
+		return cfg, nil
+	}
+	app.settingsMu.RUnlock()
+
+	data, err := (configStore{table: app.settingsTable, app: app}).Load(configSection)
 	if err != nil {
 		return turnstileSettings{}, err
 	}
@@ -224,7 +280,24 @@ func loadSettings(table string) (turnstileSettings, error) {
 	if v, ok := data["secret_key"].(string); ok {
 		settings.SecretKey = strings.TrimSpace(v)
 	}
+	if v, ok := data["test_site_key"].(string); ok {
+		settings.TestSiteKey = strings.TrimSpace(v)
+	}
+	if v, ok := data["test_secret_key"].(string); ok {
+		settings.TestSecretKey = strings.TrimSpace(v)
+	}
+	app.settingsMu.Lock()
+	app.settingsCache = settings
+	app.settingsCached = true
+	app.settingsMu.Unlock()
 	return settings, nil
+}
+
+func (app *turnstileApp) invalidateSettings() {
+	app.settingsMu.Lock()
+	app.settingsCached = false
+	app.settingsCache = turnstileSettings{}
+	app.settingsMu.Unlock()
 }
 
 func sanitizeAction(action string) string {
@@ -244,14 +317,12 @@ func sanitizeAction(action string) string {
 
 type configStore struct {
 	table string
+	app   *turnstileApp
 }
 
 func (s configStore) Load(section string) (map[string]any, error) {
 	db, _, err := extension.OpenDB()
 	if err != nil {
-		return nil, err
-	}
-	if err := extension.MigrateConfigurationStore(db, s.table); err != nil {
 		return nil, err
 	}
 	return extension.DBConfigurationStore(db, s.table).Load(section)
@@ -262,8 +333,11 @@ func (s configStore) Save(section string, data map[string]any) error {
 	if err != nil {
 		return err
 	}
-	if err := extension.MigrateConfigurationStore(db, s.table); err != nil {
+	if err := extension.DBConfigurationStore(db, s.table).Save(section, data); err != nil {
 		return err
 	}
-	return extension.DBConfigurationStore(db, s.table).Save(section, data)
+	if s.app != nil {
+		s.app.invalidateSettings()
+	}
+	return nil
 }

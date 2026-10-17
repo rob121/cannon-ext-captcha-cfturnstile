@@ -26,8 +26,10 @@ This extension exposes:
 
 Use Cannon's extension configuration screen to set:
 
-- `site_key`: public Cloudflare Turnstile site key.
-- `secret_key`: private Cloudflare Turnstile secret key.
+- `site_key` / `secret_key`: live Turnstile keys (used when Cannon **Development Mode** is off).
+- `test_site_key` / `test_secret_key`: test Turnstile keys (used when Development Mode is on).
+
+Enable **Development Mode** under Cannon → Settings → General → Development.
 
 ## Usage
 
@@ -50,7 +52,7 @@ The rendered token field is `cf-turnstile-response`.
 The extension reports:
 
 - Name: `cannon-ext-captcha-cfturnstile`
-- Version: `0.1.0`
+- Version: `0.2.2`
 - Update URL base: `https://github.com/rob121/cannon-ext-captcha-cfturnstile/releases/download`
 
 GitHub releases should include a `cannon-extension.json` manifest plus platform binaries.

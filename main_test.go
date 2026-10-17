@@ -83,12 +83,12 @@ func TestConfigurationAndProviderInfo(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("save configuration: status %d body %s", rec.Code, rec.Body.String())
 	}
-	settings, err := loadSettings(settingsTableName())
+	data, err := (configStore{table: settingsTableName()}).Load(configSection)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if settings.SiteKey != "site-123" || settings.SecretKey != "secret-456" {
-		t.Fatalf("unexpected settings: %+v", settings)
+	if data["site_key"] != "site-123" || data["secret_key"] != "secret-456" {
+		t.Fatalf("unexpected settings: %#v", data)
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/captcha", nil)
@@ -106,11 +106,65 @@ func TestConfigurationAndProviderInfo(t *testing.T) {
 	}
 }
 
+func TestSettingsCacheInvalidatesOnSave(t *testing.T) {
+	setupExtensionDB(t)
+	server := newServer().Handler()
+	postWire(t, server, "/install", extension.WireRequest{Method: http.MethodPost, URL: "/install", SiteID: "example"})
+
+	saveConfigHTTP(t, server, "site-a", "secret-a")
+	req := httptest.NewRequest(http.MethodGet, "/captcha", nil)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	var info extension.CaptchaProviderInfo
+	if err := json.NewDecoder(rec.Body).Decode(&info); err != nil {
+		t.Fatal(err)
+	}
+	if info.Client["site_key"] != "site-a" {
+		t.Fatalf("first site_key = %q", info.Client["site_key"])
+	}
+
+	saveConfigHTTP(t, server, "site-b", "secret-b")
+	req = httptest.NewRequest(http.MethodGet, "/captcha", nil)
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if err := json.NewDecoder(rec.Body).Decode(&info); err != nil {
+		t.Fatal(err)
+	}
+	if info.Client["site_key"] != "site-b" {
+		t.Fatalf("cache not invalidated, site_key = %q", info.Client["site_key"])
+	}
+}
+
+func TestActiveKeysRespectsDevelopmentMode(t *testing.T) {
+	cfg := turnstileSettings{
+		SiteKey:       "live-site",
+		SecretKey:     "live-secret",
+		TestSiteKey:   "test-site",
+		TestSecretKey: "test-secret",
+	}
+	site, secret, err := cfg.activeKeys(extension.WireRequest{})
+	if err != nil || site != "live-site" || secret != "live-secret" {
+		t.Fatalf("live: site=%q secret=%q err=%v", site, secret, err)
+	}
+	site, secret, err = cfg.activeKeys(extension.WireRequest{
+		Settings: map[string]string{extension.SettingDevelopmentMode: "true"},
+	})
+	if err != nil || site != "test-site" || secret != "test-secret" {
+		t.Fatalf("test: site=%q secret=%q err=%v", site, secret, err)
+	}
+	_, _, err = turnstileSettings{SiteKey: "live-site", SecretKey: "live-secret"}.activeKeys(extension.WireRequest{
+		Settings: map[string]string{extension.SettingDevelopmentMode: "true"},
+	})
+	if err == nil {
+		t.Fatal("expected error when test keys missing in development mode")
+	}
+}
+
 func TestRender(t *testing.T) {
 	setupExtensionDB(t)
 	server := newServer().Handler()
 	postWire(t, server, "/install", extension.WireRequest{Method: http.MethodPost, URL: "/install", SiteID: "example"})
-	saveConfig(t, "site-123", "secret-456")
+	saveConfig(t, "site-123", "secret-456", "test-site", "test-secret")
 
 	body := `{"captcha_context":"login","captcha_action":"login.submit"}`
 	req := httptest.NewRequest(http.MethodPost, "/captcha/render", strings.NewReader(body))
@@ -134,11 +188,25 @@ func TestRender(t *testing.T) {
 	if !strings.Contains(render.HeadHTML, turnstileScriptURL) {
 		t.Fatalf("expected head script, got %q", render.HeadHTML)
 	}
+
+	body = `{"captcha_context":"login","captcha_action":"login.submit","settings":{"development_mode":"true"}}`
+	req = httptest.NewRequest(http.MethodPost, "/captcha/render", strings.NewReader(body))
+	rec = httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dev render status %d body %s", rec.Code, rec.Body.String())
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&render); err != nil {
+		t.Fatalf("decode dev render: %v", err)
+	}
+	if !strings.Contains(render.HTML, `data-sitekey="test-site"`) {
+		t.Fatalf("expected test site key in development mode, got %q", render.HTML)
+	}
 }
 
 func TestVerify(t *testing.T) {
 	setupExtensionDB(t)
-	saveConfig(t, "site-123", "secret-456")
+	saveConfig(t, "site-123", "secret-456", "test-site", "test-secret")
 	var seenForm map[string][]string
 	verifyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
@@ -235,7 +303,7 @@ func postWire(t *testing.T, handler http.Handler, path string, wire extension.Wi
 	return resp
 }
 
-func saveConfig(t *testing.T, siteKey, secretKey string) {
+func saveConfig(t *testing.T, siteKey, secretKey, testSiteKey, testSecretKey string) {
 	t.Helper()
 	db, _, err := extension.OpenDB()
 	if err != nil {
@@ -245,8 +313,24 @@ func saveConfig(t *testing.T, siteKey, secretKey string) {
 		t.Fatal(err)
 	}
 	store := extension.DBConfigurationStore(db, settingsTableName())
-	if err := store.Save(configSection, map[string]any{"site_key": siteKey, "secret_key": secretKey}); err != nil {
+	if err := store.Save(configSection, map[string]any{
+		"site_key":        siteKey,
+		"secret_key":      secretKey,
+		"test_site_key":   testSiteKey,
+		"test_secret_key": testSecretKey,
+	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func saveConfigHTTP(t *testing.T, handler http.Handler, siteKey, secretKey string) {
+	t.Helper()
+	body := fmt.Sprintf(`{"section":"general","data":{"site_key":%q,"secret_key":%q}}`, siteKey, secretKey)
+	req := httptest.NewRequest(http.MethodPost, "/configuration", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save configuration: status %d body %s", rec.Code, rec.Body.String())
 	}
 }
 

@@ -2,7 +2,9 @@
 
 This extension provides Cloudflare Turnstile captcha support for Cannon protected forms.
 
-Configure the extension with the Turnstile site key and secret key from Cloudflare, then select Cloudflare Turnstile as the active captcha provider in Cannon's global captcha settings.
+Configure **Live Keys** and optional **Test Keys** under the extension settings, then select Cloudflare Turnstile as the active captcha provider in Cannon's global captcha settings.
+
+When **Development Mode** is enabled in Cannon General settings, this extension uses the test site/secret keys (Cloudflare dummy keys work well for local work). When Development Mode is off, live keys are used.
 
 Forms can render the active provider with:
 
