@@ -52,7 +52,7 @@ The rendered token field is `cf-turnstile-response`.
 The extension reports:
 
 - Name: `cannon-ext-captcha-cfturnstile`
-- Version: `0.2.2`
+- Version: `0.2.3`
 - Update URL base: `https://github.com/rob121/cannon-ext-captcha-cfturnstile/releases/download`
 
 GitHub releases should include a `cannon-extension.json` manifest plus platform binaries.

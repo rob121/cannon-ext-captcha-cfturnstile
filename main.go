@@ -23,7 +23,7 @@ const (
 	extensionName        = "cannon-ext-captcha-cfturnstile"
 	extensionTitle       = "Cloudflare Turnstile"
 	extensionDescription = "Provides Cloudflare Turnstile captcha rendering and verification for Cannon protected forms."
-	extensionVersion     = "0.2.2"
+	extensionVersion     = "0.2.3"
 	updateURLBase        = "https://github.com/rob121/cannon-ext-captcha-cfturnstile/releases/download"
 	configSection        = "general"
 	fieldName            = "cf-turnstile-response"
